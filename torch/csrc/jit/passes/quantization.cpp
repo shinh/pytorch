@@ -444,7 +444,7 @@ c10::optional<std::string> findObserverName(Value* v) {
 
 class QuantizeHelper {
  public:
-  QuantizeHelper(const script::Module& m) : module_(m) {}
+  QuantizeHelper(script::Module& m) : module_(m) {}
   // quantization parameters and scalar type
   std::tuple<IValue, IValue> getQParams(Value* v);
   c10::optional<script::Module> findChildModuleToQuantize(
@@ -459,8 +459,7 @@ class QuantizeHelper {
   }
 
  private:
-  const script::Module& module_;
-  std::vector<std::string> observer_modules_to_remove_;
+  script::Module& module_;
   std::vector<Node*> nodes_to_destroy_;
 };
 
@@ -468,7 +467,8 @@ void QuantizeHelper::removeObserver(
     Value* v,
     const std::string& observer_name) {
   // remove observer_module
-  observer_modules_to_remove_.push_back(observer_name);
+  module_.module_object()->unsafeRemoveAttr(observer_name);
+  module_.type()->unsafeRemoveAttribute(observer_name);
   // remove observer forward call
   for (const Use& u : v->uses()) {
     Node* user = u.user;
