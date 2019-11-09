@@ -40,6 +40,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.quantization import QConfig
 from torch.quantization._quantize_script import ConvPackedParams, LinearPackedParams
+from torch.quantization._quantize_script import script_qconfig
+from torch.quantization import default_observer
+from torch.quantization import default_per_channel_weight_observer
 
 # Testing utils
 import jit_utils
@@ -55,6 +58,8 @@ from common_nn import module_tests, new_module_tests, criterion_tests
 from common_methods_invocations import method_tests as autograd_method_tests
 from common_methods_invocations import create_input, unpack_variables, \
     exclude_tensor_method, non_differentiable, EXCLUDE_GRADCHECK, EXCLUDE_FUNCTIONAL
+from hypothesis import given
+from hypothesis import strategies as st
 
 # For testing truediv in python 2
 from test_module.future_div import div_int_future, div_float_future
@@ -1117,34 +1122,36 @@ graph(%x : Tensor,
                 return self.conv(x)
 
         m = torch.jit.script(M())
-        observer = torch.jit.script(Observer())
-        qconfig_dict = {
-            '':
-            QConfig(
-                activation=observer._c,
-                weight=observer._c)
-        }
-        torch._C._jit_pass_insert_observers(m._c, "forward", qconfig_dict, True)
-        data = torch.randn(1, 3, 10, 10, dtype=torch.float)
+        for is_per_channel in [True, False]:
+            observer = default_per_channel_weight_observer.with_args(ch_axis=1) if is_per_channel \
+                else default_observer
+            qconfig = QConfig(activation=observer, weight=observer)
+            qconfig_dict = {
+                '': script_qconfig(qconfig)
+            }
+            torch._C._jit_pass_insert_observers(m._c, "forward", qconfig_dict, True)
+            data = torch.randn(1, 3, 10, 10, dtype=torch.float)
 
-        get_forward(m._c)(data)
-        # right now the result will have extra observer modules
-        # will fix later when we figure out how to remove modules
-        torch._C._jit_pass_insert_quant_dequant(m._c, "forward", True)
+            get_forward(m._c)(data)
+            # right now the result will have extra observer modules
+            # will fix later when we figure out how to remove modules
+            torch._C._jit_pass_insert_quant_dequant(m._c, "forward", True)
 
-        get_forward(m._c)(data)
-        FileCheck().check_not("aten::quantize_per_tensor") \
-                   .check("prim::CallMethod[name=\"forward\"]") \
-                   .check_not("aten::quantize_per_tensor") \
-                   .check("return") \
-                   .run(str(get_forward_graph(m._c)))
-        FileCheck().check("aten::quantize_per_tensor") \
-                   .check_next("aten::dequantize") \
-                   .check("aten::conv2d") \
-                   .check("aten::quantize_per_tensor") \
-                   .check_next("aten::dequantize") \
-                   .check("return") \
-                   .run(str(get_module_method(m, 'conv', 'conv2d_forward').graph))
+            get_forward(m._c)(data)
+            quant_func = "aten::quantize_per_channel" if is_per_channel \
+                else "aten::quantize_per_tensor"
+            FileCheck().check_not(quant_func) \
+                       .check("prim::CallMethod[name=\"forward\"]") \
+                       .check_not(quant_func) \
+                       .check("return") \
+                       .run(str(get_forward_graph(m._c)))
+            FileCheck().check(quant_func) \
+                       .check_next("aten::dequantize") \
+                       .check("aten::conv2d") \
+                       .check(quant_func) \
+                       .check_next("aten::dequantize") \
+                       .check("return") \
+                       .run(str(get_module_method(m, 'conv', 'conv2d_forward').graph))
 
     @_tmp_donotuse_dont_inline_everything
     def test_insert_prepack_unpack(self):
@@ -1416,8 +1423,14 @@ graph(%input, %weight):
         " Quantized operations require FBGEMM. FBGEMM is only optimized for CPUs"
         " with instruction set support avx2 or newer.",
     )
-    @_tmp_donotuse_dont_inline_everything
-    def test_fold_prepack(self):
+    @given(
+        is_per_channel=st.booleans()
+    )
+    def test_fold_prepack(self, is_per_channel):
+        # NB: Initially I plan to put quantize_per_channel/quantize_per_tensor in branches
+        # but it turns out we won't match the quantize function calls inside branch
+        # That's why I'm copying here, maybe we can dedup the code if we can match the
+        # quantize calls in branch in the future
         class QLinear(torch.nn.Module):
             def __init__(self):
                 super(QLinear, self).__init__()
@@ -1427,6 +1440,23 @@ graph(%input, %weight):
             def forward(self, x):
                 xq = torch.quantize_per_tensor(x, 0.2, 1, torch.quint8)
                 wq = torch.quantize_per_tensor(self.weight, 0.2, 1, torch.qint8)
+                packed = torch.ops.quantized.linear_prepack(wq, self.bias)
+                w_unpacked, b_unpacked = torch.ops.quantized.linear_unpack(packed)
+                r = torch.nn.functional.linear(xq.dequantize(), w_unpacked.dequantize(), b_unpacked)
+                rq = torch.quantize_per_tensor(r, 0.2, 1, torch.quint8)
+                return rq
+
+        class QLinearPerChannel(QLinear):
+            def __init__(self):
+                super(QLinearPerChannel, self).__init__()
+
+            def forward(self, x):
+                xq = torch.quantize_per_tensor(x, 0.2, 1, torch.quint8)
+                wq = torch.quantize_per_channel(self.weight,
+                                                torch.tensor([0.2, 0.2, 0.2, 0.2, 0.2], dtype=torch.float),
+                                                torch.tensor([0, 0, 0, 0, 0], dtype=torch.int),
+                                                0,
+                                                torch.qint8)
                 packed = torch.ops.quantized.linear_prepack(wq, self.bias)
                 w_unpacked, b_unpacked = torch.ops.quantized.linear_unpack(packed)
                 r = torch.nn.functional.linear(xq.dequantize(), w_unpacked.dequantize(), b_unpacked)
@@ -1455,16 +1485,49 @@ graph(%input, %weight):
                 rq = torch.quantize_per_tensor(r, 0.2, 2, torch.quint8)
                 return rq
 
-        for name, M, data in [('linear', QLinear, torch.randn((5, 5), dtype=torch.float)),
-                              ('conv', QConv, torch.randn((1, 3, 24, 24), dtype=torch.float))]:
+        class QConvPerChannel(QConv):
+            def __init__(self):
+                super(QConvPerChannel, self).__init__()
+
+            def forward(self, x):
+                xq = torch.quantize_per_tensor(x, 0.2, 2, torch.quint8)
+                wq = torch.quantize_per_channel(self.weight,
+                                                torch.tensor([0.5] * 5, dtype=torch.float),
+                                                torch.tensor([0] * 5, dtype=torch.int),
+                                                0,
+                                                torch.qint8)
+                stride, padding, dilation, groups = [1, 1], [0, 0], [1, 1], 1
+                packed = torch.ops.quantized.conv_prepack(wq, self.bias, stride, padding, dilation, groups)
+                w_unpacked, b_unpacked = torch.ops.quantized.conv_unpack(packed)
+                r = torch.nn.functional.conv2d(xq.dequantize(),
+                                               w_unpacked.dequantize(),
+                                               b_unpacked,
+                                               stride,
+                                               padding,
+                                               dilation,
+                                               groups)
+                rq = torch.quantize_per_tensor(r, 0.2, 2, torch.quint8)
+                return rq
+
+        for name, M, data in [
+                ('linear',
+                 QLinearPerChannel if is_per_channel else QLinear,
+                 torch.randn((5, 5), dtype=torch.float)),
+                ('conv',
+                 QConvPerChannel if is_per_channel else QConv,
+                 torch.randn((1, 3, 24, 24), dtype=torch.float))]:
+            print('folding: ', name)
             m = torch.jit.script(M())
             ref_res = get_forward(m._c)(data)
             linear_packed_params = torch.jit.script(LinearPackedParams())._c
             conv_packed_params = torch.jit.script(ConvPackedParams())._c
+            torch._C._jit_pass_constant_propagation(get_forward_graph(m._c))
+            print(get_forward(m._c).graph)
             torch._C._jit_pass_fold_prepack(m._c,
                                             linear_packed_params,
                                             conv_packed_params)
             res = get_forward(m._c)(data)
+            print(get_forward(m._c).graph)
             # check attribute and graph
             packed_module_list = [x for x, _ in m._c._get_modules()
                                   if x.startswith('_' + name + '_packed_params_module')]
